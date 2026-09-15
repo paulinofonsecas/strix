@@ -44,6 +44,57 @@ def _strix_version() -> str | None:
         return None
 
 
+# Content a revision may replace. The identity of the finding (id, timestamp,
+# finding_class) and its original author stay put. dependency_metadata is
+# replaced whole, so a caller carries the package identity over itself.
+UPDATABLE_REPORT_FIELDS = frozenset(
+    {
+        "title",
+        "dependency_metadata",
+        "severity",
+        "description",
+        "impact",
+        "target",
+        "technical_analysis",
+        "poc_description",
+        "poc_script_code",
+        "remediation_steps",
+        "evidence",
+        "assumptions",
+        "counterevidence",
+        "confidence",
+        "confidence_rationale",
+        "severity_change_conditions",
+        "fix_effort",
+        "cvss",
+        "cvss_breakdown",
+        "endpoint",
+        "method",
+        "cve",
+        "cwe",
+        "code_locations",
+        "http_exchange_ids",
+        "fix_verification",
+        "fix_pr_body",
+    }
+)
+
+_LOWERCASE_REPORT_FIELDS = frozenset({"severity", "confidence", "fix_effort"})
+
+# Fields that only describe another field. A revision may raise the rating or
+# replace the locations without restating the reasoning behind the old one, and
+# that leftover reasoning then contradicts the finding it annotates
+# ("confidence: high" beside a rationale calling the evidence unconfirmed). When
+# the field they describe changes and the update carries no replacement, they
+# are dropped rather than kept.
+_DEPENDENT_REPORT_FIELDS: dict[str, tuple[str, ...]] = {
+    "confidence": ("confidence_rationale",),
+    "severity": ("severity_change_conditions",),
+    "cvss": ("cvss_breakdown",),
+    "code_locations": ("fix_verification",),
+}
+
+
 def _clean_title(title: str) -> str:
     """Return a single-line finding title.
 
@@ -117,7 +168,7 @@ def get_global_report_state() -> Optional["ReportState"]:
     return _global_report_state
 
 
-def set_global_report_state(report_state: "ReportState") -> None:
+def set_global_report_state(report_state: Optional["ReportState"]) -> None:
     global _global_report_state  # noqa: PLW0603
     _global_report_state = report_state
     # New run: drop any streamed-cost entries a prior run left unconsumed.
@@ -176,6 +227,7 @@ class ReportState:
 
         self.caido_url: str | None = None
         self.vulnerability_found_callback: Callable[[dict[str, Any]], None] | None = None
+        self.vulnerability_updated_callback: Callable[[dict[str, Any]], None] | None = None
 
         self._sarif_repo_ctx: dict[str, Any] | None = None
         self._sarif_repo_ctx_ready: bool = False
@@ -243,6 +295,12 @@ class ReportState:
                 )
             self.vulnerability_reports = [r for r in data if isinstance(r, dict)]
             for r in self.vulnerability_reports:
+                # A finding written before the class was persisted still carries the
+                # metadata of its class, so name the class it always had.
+                if not r.get("finding_class"):
+                    r["finding_class"] = (
+                        "dependency_cve" if r.get("dependency_metadata") else "dynamic"
+                    )
                 title = r.get("title")
                 stale_md = False
                 if isinstance(title, str):
@@ -283,6 +341,7 @@ class ReportState:
         cve: str | None = None,
         cwe: str | None = None,
         code_locations: list[dict[str, Any]] | None = None,
+        http_exchange_ids: list[str] | None = None,
         fix_verification: str | None = None,
         fix_pr_body: str | None = None,
         finding_class: str | None = None,
@@ -341,6 +400,8 @@ class ReportState:
             report["cwe"] = cwe.strip()
         if code_locations:
             report["code_locations"] = code_locations
+        if http_exchange_ids:
+            report["http_exchange_ids"] = http_exchange_ids
         if fix_verification:
             report["fix_verification"] = fix_verification.strip()
         if fix_pr_body:
@@ -353,16 +414,114 @@ class ReportState:
         if agent_name:
             report["agent_name"] = agent_name
 
+        if self.vulnerability_found_callback:
+            self.vulnerability_found_callback(report)
+
         self.vulnerability_reports.append(report)
         logger.info(f"Added vulnerability report: {report_id} - {title}")
         posthog.finding(severity, cwe=cwe, is_cve=bool(cve))
         scarf.finding(severity, cwe=cwe, is_cve=bool(cve))
 
-        if self.vulnerability_found_callback:
-            self.vulnerability_found_callback(report)
-
         self.save_run_data()
         return report_id
+
+    def update_vulnerability_report(
+        self,
+        report_id: str,
+        fields: dict[str, Any],
+        *,
+        update_reason: str | None = None,
+        updated_by_agent_id: str | None = None,
+        updated_by_agent_name: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Apply a revision to an existing report, keeping its id.
+
+        A field that only describes a field this update replaces is dropped when
+        the update carries no replacement for it, so the revised report cannot
+        state a new rating beside the superseded reasoning for the old one.
+
+        Returns the revised report, or ``None`` when the id is unknown or when
+        nothing in ``fields`` changes it.
+        """
+        report = next((r for r in self.vulnerability_reports if r.get("id") == report_id), None)
+        if report is None:
+            logger.warning("cannot update unknown vulnerability report %s", report_id)
+            return None
+
+        changed: dict[str, Any] = {}
+        for key, raw_value in fields.items():
+            if key not in UPDATABLE_REPORT_FIELDS or raw_value is None:
+                continue
+            value = raw_value
+            if isinstance(value, str):
+                value = _clean_title(value) if key == "title" else value.strip()
+                if key in _LOWERCASE_REPORT_FIELDS:
+                    value = value.lower()
+                if not value:
+                    continue
+            if report.get(key) == value:
+                continue
+            changed[key] = value
+
+        superseded = {
+            dependent
+            for primary, dependents in _DEPENDENT_REPORT_FIELDS.items()
+            if primary in changed
+            for dependent in dependents
+            if dependent not in changed and report.get(dependent) not in (None, "", [], {})
+        }
+
+        if not changed and not superseded:
+            logger.info("update for %s carried no new content; keeping it as is", report_id)
+            return None
+
+        entry: dict[str, Any] = {
+            "timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "fields": sorted(changed),
+        }
+        if superseded:
+            entry["dropped_fields"] = sorted(superseded)
+        if update_reason and update_reason.strip():
+            entry["reason"] = update_reason.strip()[:500]
+        if updated_by_agent_id:
+            entry["agent_id"] = updated_by_agent_id
+        if updated_by_agent_name:
+            entry["agent_name"] = updated_by_agent_name
+        for key in ("severity", "cvss", "confidence"):
+            if key in changed and report.get(key) is not None:
+                entry[f"previous_{key}"] = report[key]
+
+        raw_history = report.get("update_history")
+        history: list[dict[str, Any]] = (
+            [e for e in raw_history if isinstance(e, dict)] if isinstance(raw_history, list) else []
+        )
+        history.append(entry)
+
+        revised = {**report, **changed}
+        for dependent in superseded:
+            revised.pop(dependent, None)
+        revised["update_history"] = history
+        revised["updated_at"] = entry["timestamp"]
+
+        # Persistence must accept the revision before local state changes. A
+        # failed callback leaves the old evidence intact and the update retryable.
+        if self.vulnerability_updated_callback:
+            self.vulnerability_updated_callback(revised)
+        report.clear()
+        report.update(revised)
+
+        # The markdown on disk still shows the superseded evidence, so let the
+        # writer re-render it.
+        self._saved_vuln_ids.discard(report_id)
+
+        logger.info(
+            "Updated vulnerability report %s (%s)",
+            report_id,
+            ", ".join(entry["fields"]) or "no field replaced",
+        )
+
+        self.save_run_data()
+        return report
 
     def get_existing_vulnerabilities(self) -> list[dict[str, Any]]:
         return list(self.vulnerability_reports)
