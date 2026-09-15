@@ -317,6 +317,17 @@ strix cloud scans start --engagement-type live_test --domain-ids <uuid> --wait
 strix cloud vulns list --severity critical
 ```
 
+#### Sign in with an OpenCode subscription
+
+You can also run Strix on [OpenCode Zen](https://opencode.ai/docs/zen/) credits or an [OpenCode Go](https://opencode.ai/docs/go/) subscription:
+
+```bash
+strix auth login opencode     # paste your API key from opencode.ai/auth
+
+export STRIX_LLM="opencode/claude-sonnet-5"   # opencode/<model> runs on Zen credits
+export STRIX_LLM="opencode-go/kimi-k3"        # opencode-go/<model> runs on the Go subscription
+strix --target ./app-directory
+```
 Every [REST API](https://docs.app.strix.ai) operation has a matching `strix cloud <resource> <verb>` command. Run `strix cloud` to list the resources, and add `help` to a resource to list its verbs. Output is JSON when stdout is not a terminal or when you pass `--json`. Binary downloads are the exception: redirect the raw bytes, or combine `--output FILE --json` for download metadata.
 
 See the [cloud CLI documentation](https://docs.strix.ai/cloud/cli) for scopes, workspaces, billing, and source-upload options.
